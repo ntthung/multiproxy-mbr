@@ -1,0 +1,1477 @@
+---
+title: "Multi-Proxy, Multi-Season Streamflow Reconstruction with Mass Balance Adjustment"
+output: 
+  html_document:
+    theme: journal
+    toc: yes
+    toc_float: yes
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(fig.retina = 2)
+```
+
+# Introduction
+
+This code repository reproduces the results of the manuscript "Multi-Proxy, Multi-Season Streamflow Reconstruction with Mass Balance Adjustment" by Hung Nguyen, Stefano Galelli, Chenxi Xu, and Brendan Buckley. The manuscript is currently available as a preprint with [DOI: 10.1002/essoar.10504791.1](https://www.essoar.org/doi/10.1002/essoar.10504791.1).
+
+The repository contains all data used in and results produced by the paper. Data are stored in the folder `data/`. R scripts that are used as subroutines are in the folder `R/`. Pre-computed results are stored in the folder `results/`. 
+
+The package `mbr`, in which the mass-balance-adjusted regression is implemented, is currently available on GitHub. Before we start, please install it with
+
+```{r, eval=FALSE}
+install.packages('remotes')
+remotes::install_github('ntthung/mbr')
+```
+
+Next, we load the necessary packages and utility functions.
+
+```{r, message=FALSE, warning=FALSE}
+source('R/init.R')
+source('R/correlation_functions.R')
+```
+
+We also use some special fonts for the plots, so we need to load them as well.
+
+```{r, echo=FALSE, eval=FALSE}
+if (!require(extrafont)) install.packages('extrafont')
+extrafont::loadfonts() # For MAC
+extrafont::loadfonts(device = 'win') # For Windows
+```
+
+```{r, include=FALSE}
+if (!require(extrafont)) install.packages('extrafont')
+extrafont::loadfonts() # For MAC
+extrafont::loadfonts(device = 'win') # For Windows
+```
+
+We are now ready to proceed with the workflow.
+
+# Data and Preprocessing
+
+## Tree ring proxies
+
+### Map
+
+**Figure 1** was made in QGIS, but we can produce a similar map here with R.
+
+```{r map, fig.width=7, fig.height=6}
+# Read the metadata
+crnMeta <- fread('data/crnMeta.csv', key = 'site') # Ring width chronologies
+oxiMeta <- fread('data/oxiMeta.csv', key = 'site') # Oxygen isotope
+
+# Labelling for plots
+oxiLab <- function(s) oxiMeta[s, display] 
+crnLab <- function(s) crnMeta[s, display]
+
+meta <- rbind(oxiMeta[, .(site, display)], crnMeta[, .(site, display)])
+setkey(meta, site)
+siteLab <- function(s) meta[s, display]
+
+# Markdown code to make the species displayed in italic
+crnMeta[, species := paste0('*', species, '*')]
+oxiMeta[, species := paste0('*', species, '*')]
+
+# Map
+ggplot() +
+  # Country borders
+  geom_polygon(
+    aes(long, lat, group = group), 
+    map_data('world', c('Vietnam', 'Laos', 'Cambodia', 'Thailand', 'Myanmar')),
+    fill = 'gray98', colour = 'black') +
+  # Ring width sites
+  geom_point(
+    aes(long, lat, colour = species, shape = 'Ring width'), 
+    size = 2,
+    crnMeta) +
+  # Oxygen isotope sites
+  geom_point(
+    aes(long, lat -0.25, colour = species, shape = '&delta;<sup>18</sup>O'), 
+    size = 2,
+    oxiMeta) +
+  # Map theming
+  scale_x_continuous(name = NULL, labels = pasteLong) +
+  scale_y_continuous(name = NULL, labels = pasteLat) +
+  scale_colour_brewer(name = 'Species', palette = 'Set1') +
+  scale_shape_discrete(name = 'Proxy') +
+  coord_quickmap() +
+  theme(
+    legend.key.height = unit(0.75, 'cm'),
+    legend.text = element_markdown()) +
+  panel_border('black', 0.2)
+```
+
+### Time series
+
+Now we read the proxy data and infill them with the package `missMDA`.
+
+```{r impute}
+# Read data
+oxi <- fread('data/oxi.csv', key = 'site') 
+crn <- fread('data/crn.csv', key = 'site')
+
+# Count number of years in each chronology
+crnCount <- crn[year %in% 1748:2005, .(first = year[1], final = year[.N], .N), by = site
+              ][order(N, decreasing = TRUE)
+              ][, ID := .GRP, by = site]
+oxiCount <- oxi[year %in% 1748:2005, .(first = year[1], final = year[.N], .N), by = site
+              ][order(N, decreasing = TRUE)
+              ][, ID := .GRP, by = site]
+
+# Imputation
+crnWideFull   <- crn[year %in% 1748:2005, dcast(.SD, year ~ site, value.var = 'rwi')]
+crnMatFull    <- as.matrix(crnWideFull[, -'year'])
+crnImpModel   <- imputePCA(crnMatFull, ncp = 19)
+crnMatFilled  <- crnImpModel$completeObs
+crnWideFilled <- as.data.table(crnMatFilled)
+
+attributes(crnImpModel$fittedX) <- attributes(crnImpModel$completeObs)
+crnPcaImputed <-
+  as.data.table(crnImpModel$fittedX)[, year := crnWideFull$year] %>%
+  melt(id.var = 'year', variable.name = 'site', value.name = 'X')
+
+oxiWideFull   <- oxi[year %in% 1748:2005, dcast(.SD, year ~ site, value.var = 'do18')]
+oxiMatFull    <- as.matrix(oxiWideFull[, -'year'])
+oxiImpModel   <- imputePCA(oxiMatFull, ncp = 3)
+oxiMatFilled  <- oxiImpModel$completeObs
+oxiWideFilled <- as.data.table(oxiMatFilled)
+
+attributes(oxiImpModel$fittedX) <- attributes(oxiImpModel$completeObs)
+oxiPcaImputed <-
+  as.data.table(oxiImpModel$fittedX)[, year := oxiWideFull$year] %>%
+  melt(id.var = 'year', variable.name = 'site', value.name = 'X')
+```
+
+**Figure S6**
+
+```{r, fig.width=8, fig.height=7}
+crnSpan <- ggplot(crnCount) +
+  geom_rect(
+    aes(xmin = first, xmax = final, ymin = ID - 1, ymax = ID + 0.1), 
+    fill = 'steelblue') +
+  geom_text(
+    aes(1950, ID - 0.5, label = crnLab(site)), 
+    colour = 'wheat', 
+    fontface = 'bold', 
+    size = 3.5) +
+  scale_x_continuous(expand = c(0, 0), breaks = seq(1750, 2005, 10), labels = skip_label(5)) +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(x = NULL, y = 'Number of chronologies', subtitle = 'Ring width') +
+  theme(
+    plot.subtitle = element_text(face = 'bold'),
+    panel.background = element_rect('gray95'),
+    panel.grid = element_blank())
+oxiSpan <- ggplot(oxiCount) +
+  geom_rect(
+    aes(xmin = first, xmax = final, ymin = ID - 1, ymax = ID + 0.1), fill = 'steelblue') +
+  geom_text(
+    aes(1950, ID - 0.5, label = oxiLab(site)), 
+    colour = 'wheat', 
+    fontface = 'bold', 
+    size = 3.5) +
+  scale_x_continuous(expand = c(0, 0), breaks = seq(1750, 2005, 10), labels = skip_label(5)) +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(x = NULL, y = 'Number of chronologies', subtitle = '&delta;<sup>18</sup>O') +
+  theme(
+    plot.subtitle = element_markdown(face = 'bold'),
+    panel.background = element_rect('gray95'),
+    panel.grid = element_blank())
+
+crnSpan + oxiSpan +
+  plot_layout(heights = c(5, 1.2)) +
+  plot_annotation(title = 'Temporal coverage')
+```
+
+**Figure S7**
+
+```{r, fig.width=8, fig.height=8}
+crnImpPlot <- ggplot() +
+  geom_line(aes(year, rwi, colour = 'RWI', linetype = 'RWI'), crn[year >= 1748]) +
+  geom_line(aes(year, X, colour = 'Imputed', linetype = 'Imputed'), crnPcaImputed) +
+  scale_colour_manual(
+    name = NULL,
+    breaks = c('RWI', 'Imputed'),
+    values = c('steelblue', 'darkorange')) +
+  scale_linetype_manual(
+    name = NULL,
+    breaks = c('RWI', 'Imputed'),
+    values = c(1, 2)) +
+  facet_wrap(
+    vars(site),
+    labeller = as_labeller(crnLab),
+    ncol = 4,
+    scales = 'free_y') +
+  labs(x = NULL, y = 'RWI') 
+
+oxiImpPlot <- ggplot() +
+  geom_line(
+    aes(year, do18, colour = '&delta;<sup>18</sup>O', linetype = '&delta;<sup>18</sup>O'), 
+    oxi[year >= 1748]) +
+  geom_line(
+    aes(year, X, colour = 'Imputed', linetype = 'Imputed'), 
+    oxiPcaImputed) +
+  scale_colour_manual(
+    name = NULL,
+    breaks = c('&delta;<sup>18</sup>O', 'Imputed'),
+    values = c('steelblue', 'darkorange')) +
+  scale_linetype_manual(
+    name = NULL,
+    breaks = c('&delta;<sup>18</sup>O', 'Imputed'),
+    values = c(1, 2)) +
+  facet_wrap(
+    vars(site),
+    labeller = as_labeller(oxiLab),
+    ncol = 4,
+    scales = 'free_y') +
+  labs(x = NULL, y = '&delta;<sup>18</sup>O') +
+  theme(
+    axis.title.y = element_markdown(),
+    legend.text = element_markdown())
+
+pl <- crnImpPlot + oxiImpPlot & 
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(face = 'plain'),
+    legend.position = 'top',
+    legend.key.width = unit(2, 'cm'),
+    panel.border = element_rect(NA, 'black', 0.2))
+pl +
+  plot_layout(ncol = 1, heights = c(5, 1)) +
+  plot_annotation(title = 'Comparing imputed values with proxies')
+
+```
+
+## Streamflow
+
+### Exploring monthly streamflow
+
+**Figure S1**
+
+```{r, fig.width=8, fig.height=6}
+p1m <- fread('data/P1-monthly.csv')
+p1m[, Qa := sum(Qm), by = year]
+ggplot(p1m[year %in% 1922:2016]) +
+  geom_point(aes(Qa, Qm / Qa * 100), colour = 'steelblue') +
+  facet_wrap(
+    vars(month),
+    labeller = as_labeller(monthLab),
+    ncol = 4,
+    scales = 'free') +
+  labs(x = 'Annual flow [Mm\u00b3]', y = 'Monthly flow fraction [%]') +
+  panel_border('black', 0.2)
+```
+
+**Figure S5**
+
+```{r, fig.width=8, fig.height=4}
+ggplot(p1m) +
+  geom_boxplot(aes(factor(month, labels = month.abb), Qm)) +
+  labs(x = NULL, y = 'Q [Mm\u00b3]')
+```
+
+### Season delineation
+
+Read daily data.
+
+```{r daily-data}
+p1d <- fread('data/P1-daily-raw.csv')
+# Calculate day of the year
+p1d[, doy := {
+  date <- paste(year, month, day, sep = '-') %>% as.Date(format = c('%Y-%B-%d'))
+  yday(date)
+}]
+# Ignore leap days
+p1d <- p1d[!(year %% 4 == 0 & doy == 60)]
+p1d[year %% 4 == 0 & doy > 59, doy := doy - 1]
+p1DailyMean <- p1d[, .(mu = mean(Q, na.rm = TRUE)), keyby = doy]
+p1d[Q <= 0, Q := p1DailyMean[doy, mu]]
+
+# Convert flow rate to volumetric (m3/s to million m3 each day)
+p1d[, Qv := cumsum(Q * 0.0864), by = year] 
+p1dfy <- p1d[year %in% 1922:2016] # Full years
+setkey(p1dfy, year, doy)
+```
+
+Two-phase linear regression, following Cook and Buckley (2009).
+
+```{r change-point}
+# Changepoint functions
+ssq_left_right <- function(x, t.range, d) {
+  idx1 <- which(t.range <= d)
+  idx2 <- which(t.range >  d)
+  t1   <- matrix(c(rep(1, length(idx1)), t.range[idx1]), ncol = 2)
+  t2   <- matrix(c(rep(1, length(idx2)), t.range[idx2]), ncol = 2) 
+  left  <- .lm.fit(t1, x[idx1])$residuals
+  right <- .lm.fit(t2, x[idx2])$residuals
+  sum(left^2) + sum(right^2)
+}
+
+# doy.range: vector of days of the year, must be contiguous
+scan_2lr <- function(DT, doy.range, scan.range, var.name) {
+  dt <- DT[doy %in% doy.range]
+  x <- dt[, get(var.name)]
+  ssq <- sapply(scan.range, ssq_left_right, x = x, t.range = doy.range)
+  data.table(doy = scan.range, ssq = ssq)
+}
+
+summary_2lr <- function(ssq) ssq[which.min(ssq)][, date := doy_to_ddMMM(doy)][]
+
+plot_2lr <- function(ssq, nudge_y = 2) {
+  changeDate <- summary_2lr(ssq)
+  ggplot(ssq, aes(doy, ssq)) +
+    geom_line(colour = 'steelblue') +
+    geom_point(data = changeDate, colour = 'steelblue') +
+    geom_text(aes(label = date), changeDate, nudge_y = nudge_y) +
+    labs(x = 'Day of year', y = 'RSS') +
+    theme_classic()
+}
+dryRange <- seq(  1, 280)
+dryScan  <- seq( 51, 270)
+wetRange <- seq(220, 365)
+wetScan  <- seq(230, 355)
+d2wAnn <- p1dfy[, summary_2lr(scan_2lr(.SD, dryRange, dryScan, 'Qv')), by = year]
+w2dAnn <- p1dfy[, summary_2lr(scan_2lr(.SD, wetRange, wetScan, 'Qv')), by = year]
+annualWetSeason <- merge(d2wAnn[, .(year, doy, date)], w2dAnn[, .(year, doy, date)],
+                         by = 'year',
+                         suffixes = c('sta', 'fin'))
+```
+
+Plot.
+
+```{r, fig.width=8, fig.height=7}
+Qtails <- p1dfy[, last(.SD), by = year
+              ][order(Qv), rbind(head(.SD, 3), last(.SD, 3))]
+yearOrder <- Qtails$year
+cumuPlot <- ggplot(p1dfy) +
+  geom_line(aes(doy, Qv, group = year), na.rm = TRUE, colour = 'gray', size = 0.2) +
+  geom_line(
+    aes(doy, Qv, group = year, colour = factor(year, levels = yearOrder)), 
+    p1d[year %in% Qtails$year], 
+    size = 0.4, show.legend = FALSE) +
+  geom_text(
+    aes(366, Qv, label = year), 
+    Qtails, 
+    vjust = c(0.5, 0.5, 0.5, 0.9, 0.5, 0.5),
+    hjust = 0, 
+    size = 2.5) +
+  stat_summary(aes(doy, Qv), fun = mean, geom = 'line', na.rm = TRUE, size = 0.6) +
+  scale_x_continuous(breaks = c(1, 100, 200, 300), labels = doy_month_label) +
+  scale_colour_brewer(palette = 'RdBu') +
+  labs(x = 'Day of the year', y = 'Q [million m\u00b3]') 
+
+p1 <- ggplot(annualWetSeason) +
+  geom_linerange(aes(year, ymin = doysta, ymax = doyfin), colour = 'gray', size = 0.2) +
+  geom_line(aes(year, doysta), size = 0.2, colour = 'darkorange') +
+  geom_line(aes(year, doyfin), size = 0.2, colour = 'steelblue') +
+  geom_point(aes(year, doysta), size = 0.7, colour = 'darkorange') +
+  geom_point(aes(year, doyfin), size = 0.7, colour = 'steelblue') +
+  scale_colour_manual(name = NULL, values = c('darkgreen', 'steelblue')) +
+  scale_x_continuous(breaks = seq(1920, 2015, 5),
+                     labels = function(x) ifelse(x %% 10 == 0, x, '')) +
+  scale_y_continuous(breaks = c(110, seq(100, 300, 50)), labels = doy_month_label) +
+  labs(x = 'Year', y = 'Day of the year') +
+  theme(legend.position = 'none')
+p2 <- ggplot(annualWetSeason) +
+  geom_density(
+    aes(y = doysta), 
+    size = 0.3, 
+    colour = 'darkorange',
+    fill = 'darkorange',
+    alpha = 0.25) +
+  geom_density(
+    aes(y = doyfin), 
+    size = 0.3, 
+    colour = 'steelblue', 
+    fill = 'steelblue', 
+    alpha = 0.25) +
+  geom_hline(aes(yintercept = mean(doysta)), size = 0.2, colour = 'darkorange') +
+  geom_hline(aes(yintercept = mean(doyfin)), size = 0.2, colour = 'steelblue') +
+  scale_x_continuous(breaks = scales::pretty_breaks(2)) +
+  scale_y_continuous(breaks = c(110, seq(100, 300, 50))) +
+  labs(x = 'Density', y = NULL) +
+  theme(
+    plot.tag.position = c(-0.2, 1),
+    plot.margin = margin(l = 20),
+    axis.text.y = element_blank())
+
+delinPlot <- p1 + p2 + 
+  plot_layout(widths = c(4, 1)) 
+
+wrap_plots(cumuPlot) + wrap_plots(delinPlot) +
+  plot_layout(ncol = 1, heights = c(1.5, 1)) +
+  plot_annotation(tag_levels = 'a', tag_suffix = ')')
+
+```
+
+### Daily streamflow naturalization
+
+We use robust empirical quantile mapping, following Gudmundsson *et al*. (2012). The procedure is implemented in the package `qmap` (Gudmundsson, 2016). See also Robeson *et al.* (2020).
+
+```{r naturalization}
+# Merge VIC-Res simulated streamflow to daily streamflow
+p1MergeDaily <- merge(
+  p1d[year %in% 1922:2005, .(year, month = match(month, month.abb), day, Qobs = Q)],
+  fread('data/P1-VIC-Res.csv'),
+  on = c('year', 'month', 'day'))
+p1MergeDaily[, period := fifelse(year > 1985, 'Since 1985', 'Before 1985')]
+
+#Naturalize with quantile mapping.
+p1MergeDaily[, Qnat := {
+  fit <- fitQmap(.SD[period == 'Before 1985', Qobs],
+                 .SD[period == 'Before 1985', Qvic],
+                 'RQUANT', 
+                 nlls = 30, wet.day = FALSE, nboot = 100)
+  doQmap(.SD[, Qvic], fit)
+}, by = month]
+
+# Calculate monthly means
+p1Mon <- p1MergeDaily[, lapply(.SD, mean), by = .(year, month, period), .SDcols = -'day']
+
+p1MonLong <- melt(
+  p1Mon[period == 'Before 1985', -'period'], # Use data before 1985 only
+  id.var = c('year', 'month'), 
+  variable.name = 'type',
+  value.name = 'Q',
+  variable.factor = FALSE)
+
+# Calculate volumetric flow
+p1DayLong <- melt(
+  p1MergeDaily[, -'period'],
+  id.var = c('year', 'month', 'day'), 
+  variable.name = 'type',
+  value.name = 'Q',
+  variable.factor = FALSE)
+p1DayLong[, Q := Q * 3600 * 24 / 1e6]
+
+p1MonVol <- p1DayLong[, .(Q = sum(Q)), by = .(year, month, type)] 
+
+# Aggregate to seasonal flows
+
+# First, define the seasons
+names(seasons) <- seasons <- c('NJ', 'JO', 'WY')
+seasonClass <- fread('data/season_class.csv', key = 'season')
+ssnLabBrief <- function(x) seasonClass[x, type]
+
+# Get seasonal total
+natSeas <- rbindlist(list(
+  NJ = p1MonVol[, get_seasons(.SD, 'Q', 'Qa', c(11:12, 1:6), months.fwd = 11:12), by = type],
+  JO = p1MonVol[, get_seasons(.SD, 'Q', 'Qa', 7:10), by = type],
+  WY = p1MonVol[, get_seasons(.SD, 'Q', 'Qa', 1:12, months.fwd = 11:12), by = type]),
+  idcol = 'season')
+
+natSeas[, type := fcase(type == 'Qvic', 'Uncorrected',
+                        type == 'Qobs', 'Observed',
+                        type == 'Qnat', 'Bias-corrected')]
+natSeas[, season := factor(season, seasons)]
+```
+
+Plot results.
+
+```{r naturalization-plot, fig.width=7, fig.height=7}
+Qx <- seq(min(p1MonLong$Q), max(p1MonLong$Q), length.out = 1000)
+cdf <- p1MonLong[, .(Q = Qx, FQ = ecdf(Q)(Qx)), by = type]
+
+cdf[, type := fcase(type == 'Qvic', 'Uncorrected',
+                    type == 'Qobs', 'Observed',
+                    type == 'Qnat', 'Bias-corrected')]
+
+monCDFcomm <- ggplot(cdf, aes(Q, FQ, colour = type, linetype = type)) +
+  geom_line() +
+  scale_colour_manual(name = NULL, values = c('darkorange', 'black', 'gray')) +
+  scale_linetype_manual(name = NULL, values = c(1, 2, 1)) +
+  labs(x = 'Q [m\u00b3/s]', y = 'F(Q)') +
+  labs(subtitle = 'b) CDF of monthly data') 
+
+DT <- melt(p1MergeDaily[period == 'Before 1985', -'period'],
+           id.var = c('year', 'month', 'day'), 
+           variable.name = 'type',
+           value.name = 'Q',
+           variable.factor = FALSE)
+Qx <- seq(min(DT$Q), max(DT$Q), length.out = 1000)
+cdf <- DT[, .(Q = Qx, FQ = ecdf(Q)(Qx)), by = type]
+cdf[, type := fcase(type == 'Qvic', 'Uncorrected',
+                    type == 'Qobs', 'Observed',
+                    type == 'Qnat', 'Bias-corrected')]
+
+dayCDF <- ggplot(cdf, aes(Q, FQ, colour = type, linetype = type)) +
+  geom_line() +
+  scale_colour_manual(name = NULL, values = c('darkorange', 'black', 'grey')) +
+  scale_linetype_manual(name = NULL, values = c(1, 2, 1)) +
+  labs(x = 'Q [m\u00b3/s]', y = 'F(Q)') +
+  labs(subtitle = 'a) CDF of daily data')
+
+tsPlot <- ggplot(natSeas) + 
+  geom_rect(aes(xmin = 1976, xmax = 1985, ymin = -Inf, ymax = Inf), fill = 'gray97') +
+  geom_line(aes(year, Qa, colour = type, linetype = type)) +
+  facet_wrap(vars(season), scales = 'free_y', ncol = 1, labeller = as_labeller(ssnLabBrief)) +
+  scale_linetype_manual(name = NULL, values = c(1, 2, 1)) +
+  scale_colour_manual(name = NULL, values = c('darkorange', 'black', 'grey')) +
+  scale_x_continuous(
+    expand = c(0, 0),
+    breaks = seq(1975, 2005, 5)) +
+  labs(
+    subtitle = 'c) Time series',
+    x = NULL, 
+    y = 'Volumetric flow [million m\u00b3]') 
+
+layout <- '
+DDDD
+AABB
+AABB
+AABB
+AABB
+CCCC
+CCCC
+CCCC
+CCCC
+CCCC
+CCCC
+CCCC
+CCCC
+CCCC
+CCCC
+CCCC
+CCCC
+'
+
+monCDFcomm <- monCDFcomm + 
+  theme(axis.text.y = element_blank(),
+        axis.title.y = element_blank(),
+        axis.line.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+pl <- dayCDF + monCDFcomm + tsPlot + guide_area() & 
+  theme(
+    strip.background = element_blank(),
+    plot.subtitle = element_text(face = 'bold'),
+    legend.key.width = unit(1.5, 'cm'), 
+    legend.position = 'top')
+pl + plot_layout(design = layout, guides = 'collect') 
+```
+
+### Combine flow
+
+```{r}
+# Seasonal observed flow from 1922 to 1985
+p1s <- rbindlist(list(
+  NJ = get_seasons(p1m, 'Qm', 'Qa', c(11:12, 1:6), months.fwd = 11:12),
+  JO = get_seasons(p1m, 'Qm', 'Qa', 7:10),
+  WY = get_seasons(p1m, 'Qm', 'Qa', 1:12, months.fwd = 11:12) # New water year, Nov - Oct
+), idcol = 'season')[year %in% 1922:1984]
+p1s[, season := factor(season, levels = seasons)]
+setkey(p1s, season)
+
+# Naturalized seasonal flow from 1986 to 2005
+p1merge <- rbind(
+  p1s,
+  natSeas[type == 'Bias-corrected' & year >= 1985, -'type'])
+p1merge[, season := factor(season, seasons)]
+setkey(p1merge, season)
+
+# Target: 1922:2003
+p1tar <- p1merge[, .SD[1:82], by = season]
+
+## Hinkley D and transformation type
+p1HD <- p1merge[, .(D   = round(hinkley(Qa), 2), 
+                    Dlog = round(hinkley(log(Qa)), 2)), 
+                keyby = season
+              ][, trans := fifelse(abs(D) > abs(Dlog), 'log', 'none')]
+```
+
+**Table S1.** Flow transformation type.
+
+```{r}
+p1HD[]
+```
+
+**Figure S4**
+
+```{r, fig.width=6.5, fig.height=3}
+instDens <- p1tar[, {
+  bw <- if (.BY$season == 'NJ') 0.7 else 0.5
+  d1 <- density(standardize(Qa), bw = bw, cut = 1)
+  d2 <- density(standardize(log(Qa)), bw = bw, cut = 1)
+  c(list(x0 = d1$x, y0 = d1$y, xlog = d2$x, ylog = d2$y))
+}, by = season]
+
+ggplot(instDens) +
+  geom_line(aes(x0, y0, colour = 'No transformation')) +
+  geom_line(aes(xlog, ylog, colour = 'Log transformation')) +
+  scale_colour_manual(
+    name = NULL,
+    values = pal) +
+  facet_wrap(
+    vars(season),
+    labeller = as_labeller(ssnLabBrief),
+    scales = 'free') +
+  labs(x = 'z-score', y = 'Density') +
+  theme(
+    strip.background = element_rect('gray95', NA),
+    legend.key.width = unit(2, 'cm'),
+    legend.position = 'top')
+```
+
+So all targets need to be log-transformed.
+
+# Correlation analyses
+
+## Streamflow-proxy correlations
+
+Bootstrapped correlations.
+
+```{r correlation-calc}
+# Input matrices
+allLags <- -2:2 # Core years: 1750:2003, and shift back or forth
+Xrw <- do.call(cbind, lapply(allLags, function(l) {
+  x <- crnMatFilled[3:256 - l, ]
+  colnames(x) <- paste0(colnames(x), l)
+  x
+}))
+Xdo <- do.call(cbind, lapply(allLags, function(l) {
+  x <- oxiMatFilled[3:256 - l, ]
+  colnames(x) <- paste0(colnames(x), l)
+  x
+}))
+Xrwdo <- cbind(Xrw, Xdo)
+
+# Streamflow target: 1922 to 2003
+QMat    <- log(as.matrix(dcast(p1tar, year ~ season, value.var = 'Qa')[, -'year']))
+cor_lag <- function(X, Y, l, Xyears, Yyears, alpha) {
+  ind <- which(Xyears %in% Yyears) - l
+  cor_boot(cbind(X[ind, ], Y), 
+           1:ncol(X),
+           1:ncol(Y) + ncol(X),
+           c('site', 'season'), 
+           alpha = alpha) 
+}
+set.seed(42)
+rhoCrn <- lapplyrbind(allLags, function(l) {
+    DT <- cor_lag(crnMatFilled, QMat, l, 1748:2005, 1922:2003, 0.05)
+    DT[, lag := l]
+    DT[, alpha := 0.05][]
+  })
+rhoOxi <- lapplyrbind(allLags, function(l) {
+    DT <- cor_lag(oxiMatFilled, QMat, l, 1748:2005, 1922:2003, 0.05)
+    DT[, lag := l]
+    DT[, alpha := 0.05][]
+  })
+
+dt <- CJ(s = factor(seasons, seasons), l = allLags)
+dt[, sl := paste0(s, '(', l, ')')]
+
+rhoCrn[, season_lag := paste0(season, '(', lag, ')')]
+rhoCrn[, season_lag := factor(season_lag, levels = dt$sl)]
+rhoCrn[, season := factor(season, levels = seasons)]
+rhoCrn[, lag := factor(lag, levels = allLags)]
+rhoOxi[, season_lag := paste0(season, '(', lag, ')')]
+rhoOxi[, season_lag := factor(season_lag, levels = dt$sl)]
+rhoOxi[, season := factor(season, levels = seasons)]
+rhoOxi[, lag := factor(lag, levels = allLags)]
+```
+
+**Figure 2**
+
+```{r cor-plot, fig.width=8, fig.height=8}
+ssnLabLag <- function(x) {
+  char <- sapply(x, substr, start = 1, stop = 2)
+  yr <- sapply(x, function(xx) {
+    c1 <- substr(xx, 4, 4)
+    if (c1 == '-') c1 <- substr(xx, 4, 5)
+    c1
+  })
+  fcase(
+    char == 'NJ', paste0('<span style="color:', dark2[1], '">', yr, '</span>'),
+    char == 'JO', paste0('<span style="color:', dark2[2], '">', yr, '</span>'),
+    char == 'WY', paste0('<span style="color:', dark2[3], '">', yr, '</span>')
+  )
+}
+
+p1 <- ggplot(rhoCrn) +
+  geom_hline(yintercept = 0, colour = 'gray') +
+  geom_vline(
+    xintercept = c(length(allLags) + 0.5, length(allLags) * 2 + 0.5), 
+    colour = 'gray') +
+  geom_linerange(aes(season_lag, ymin = low, ymax = high, alpha = signif, colour = season)) +
+  geom_point(aes(season_lag, median, alpha = signif, colour = season)) +
+  scale_colour_manual(name = 'Season', values = dark2, labels = ssnLabBrief) +
+  facet_wrap(vars(site), labeller = as_labeller(crnLab), ncol = 4) +
+  scale_alpha_manual(name = 'Significance', values = c(0.25, 1)) +
+  scale_x_discrete(labels = ssnLabLag) +
+  scale_y_continuous(breaks = c(-0.6, -0.4, -0.2, 0, 0.2, 0.4, 0.6)) +
+  labs(
+    x = 'Lag [years]', y = 'Correlation [-]',
+    subtitle = 'a) Correlations between ring width and instrumental + naturalized streamflow') +
+  theme(axis.text.x = ggtext::element_markdown(family = 'Arial Narrow', size = 8),
+        axis.ticks.y = element_blank(),
+        axis.line = element_line(size = 0.1),
+        axis.ticks.x = element_line(size = 0.1),
+        legend.key.width = unit(0.1, 'cm'),
+        legend.text = element_text(margin = margin(r = 0.3, unit = 'cm')),
+        legend.title = element_text(margin = margin(r = 0.3, unit = 'cm')),
+        legend.position = 'top',
+        legend.box.spacing = unit(-0.3, 'cm'),
+        panel.grid.major.y = element_line('gray95', 0.1),
+        panel.border = element_rect(NA, 'black', 0.1),
+        strip.text = element_text(face = 'plain'),
+        strip.background = element_blank(),
+        plot.subtitle = element_text(face = 'bold'))
+p2 <- ggplot(rhoOxi) +
+  geom_hline(yintercept = 0, colour = 'gray') +
+  geom_vline(
+    xintercept = c(length(allLags) + 0.5, length(allLags) * 2 + 0.5), 
+    colour = 'gray') +
+  geom_linerange(aes(season_lag, ymin = low, ymax = high, alpha = signif, colour = season)) +
+  geom_point(aes(season_lag, median, alpha = signif, colour = season)) +
+  facet_wrap(vars(site), labeller = as_labeller(oxiLab), nrow = 1) +
+  scale_colour_manual(name = 'Season', values = dark2, labels = ssnLabBrief) +
+  scale_alpha_manual(name = 'Significance', values = c(0.25, 1)) +
+  scale_x_discrete(labels = ssnLabLag) +
+  scale_y_continuous(breaks = c(-0.6, -0.4, -0.2, 0, 0.2, 0.4, 0.6)) +
+  labs(
+    x = 'Lag [years]', y = 'Correlation [-]',
+    subtitle = 'b) Correlations between \u03b4\u00b9\u2078O and instrumental + naturalized streamflow') +
+  theme(axis.text.x = ggtext::element_markdown(family = 'Arial Narrow', size = 8),
+        axis.ticks.y = element_blank(),
+        axis.ticks.x = element_line(size = 0.1),
+        axis.line = element_line(size = 0.1),
+        panel.grid.major.y = element_line('gray95', 0.1),
+        panel.border = element_rect(NA, 'black', 0.1),
+        legend.position = 'none',
+        strip.text = element_text(face = 'plain'),
+        strip.background = element_blank(),
+        plot.subtitle = element_text(face = 'bold'))
+
+p1 / p2 + plot_layout(heights = c(6.25, 1))
+```
+
+## Proxy-climate correlations
+
+We calculate the correlations between tree rings and CRU TS-4.04 precipitation data (Harris *et al.*, 2020). Here we provide a subset of the CRU data set that contains only the grid points in Southeast Asia.
+
+```{r}
+pre <- readRDS('data/CRU-precip.RDS')
+preMS <- pre[month %in% 7:10, .(pre = sum(pre)), by = .(lon, lat, year)]
+preMAM <- pre[month %in% 3:5, .(pre = sum(pre)), by = .(lon, lat, year)]
+preMS.sd <- preMS[, .(sd = sd(pre)), by = .(lon, lat)][sd < 0.1]
+setkey(preMS, lon, lat)
+setkey(preMS.sd, lon, lat)
+preMS <- preMS[!preMS.sd]
+
+corMS <- grid_cor(crn, preMS, 'rwi', 'pre', crnMeta)
+corMAM <- grid_cor(crn, preMAM, 'rwi', 'pre', crnMeta)
+
+corOxiMS <- grid_cor(oxi, preMS, 'do18', 'pre', oxiMeta)
+corOxiMAM <- grid_cor(oxi, preMAM, 'do18', 'pre', oxiMeta)
+```
+
+### Tree rings
+
+**Figure S8**
+
+```{r, fig.width=8, fig.height=7}
+plot_cor(corMS) 
+```
+
+**Figure S9**
+
+```{r, fig.width=8, fig.height=7}
+plot_cor(corMAM, cor.limits = abs_range(corMS$rho$r)) 
+```
+
+### Oxygen isotope
+
+**Figure S10**
+
+```{r, fig.width=8, fig.height=4}
+p1 <- plot_cor(corOxiMS) 
+p2 <- plot_cor(corOxiMAM, cor.limits = abs_range(corOxiMS$rho$r))
+p1 + p2 +
+  plot_layout(ncol = 1, guides = 'collect') 
+```
+
+# Reconstruction
+
+## Site selection
+
+The site selection script is provided in the file `site-selection-GA.R`. At the beginning of the script, you can set three parameters: `lambda`, the penalty weight; `pop`, the genetic algorithm's population size, and `gen`, the number of generations. Then you can source the script with
+
+```{r, eval=FALSE}
+source('site-selection-GA.R')
+```
+
+or if you are using RStudio, we recommend that you submit it as a local job so that it does not freeze your RStudio. Alternatively, if you have access to a computing cluster, you can submit the script to your cluster. On a normal desktop, the script takes about 4 hours. On my 24-core 2.10 GHz cluster, it took about 33 minutes.
+
+In this repository, we provide two set of reconstructions, one with &lambda; = 0, and another with &lambda; = 1, as we presented in the paper. Both were run with `pop = 500` and `gen = 500`.
+
+## Cross-validation and final reconstruction
+
+```{r optim-results}
+# Read GA results
+siteOptim_l0 <- readRDS('results/pop500_gen500_lambda0.RDS')
+siteOptim_l1 <- readRDS('results/pop500_gen500_lambda1.RDS')
+
+# Get sites from GA results
+poolDT <- rbind(rhoCrn[{signif} & abs(rho0) >= 0.2, .(site, lag), by = season],
+                rhoOxi[{signif} & abs(rho0) >= 0.2, .(site, lag), by = season])
+poolDT[, site2 := paste0(site, lag)]
+setkey(poolDT, season)
+
+mbPool <- rbindlist(
+  list(
+    '0.0' = poolDT[c(siteOptim_l0@solution) == 1],
+    '1.0' = poolDT[c(siteOptim_l1@solution) == 1]
+  ),
+  idcol = 'lambda')
+
+# Run cross validation to get R2, RE, and CE
+lambdas = c('0.0' = '0.0', '1.0' = '1.0')
+pc3seasons <- 
+  lapply(lambdas, function(l) 
+    lapply(seasons, function(s) {
+      Qa <- p1tar[s]
+      X <- Xrwdo[, mbPool[season == s & lambda == l, site2]]
+      PC <- wPCA(X, use.eigen = FALSE, return.matrix = TRUE)
+      sv <- input_selection(PC[173:254, ], Qa$Qa, 'leaps backward', nvmax = 8)
+      PC[, sv, drop = FALSE]
+    }))
+set.seed(24)
+cvFolds <- make_Z(1922:2003, nRuns = 50, frac = 0.25, contiguous = TRUE)
+
+cv <- lapplyrbind(lambdas, function(l) 
+    cv_mb(p1tar, pc3seasons[[l]], cvFolds, 1750, 
+          lambda = as.numeric(l),
+          log.trans = 1:3,
+          return.type = 'all'),
+    id = 'lambda')
+cv[, season := factor(season, seasons)]
+# Calculate the robust mean
+cvRM <- cv[, 
+           lapply(.SD, dplR::tbrm), 
+           .SDcols = c('R2', 'RE', 'CE'), 
+           keyby = .(lambda, season)]
+
+# Final reconstruction
+rec <- lapplyrbind(lambdas, function(l) 
+  mb_reconstruction(p1tar, pc3seasons[[l]], 1750, lambda = as.numeric(l), log.trans = 1:3))
+
+rec[, season := factor(season, seasons)]
+rec[, lambda := paste0(lambda, '.0')]
+```
+
+# Results
+
+## GA convergence
+
+**Figure S11**
+
+```{r, fig.width=7, fig.height=4}
+par(mfrow = c(1, 2))
+plot(
+  siteOptim_l0, 
+  main = expression(lambda == 0), 
+  col = c('steelblue', NA, adjustcolor('steelblue', alpha.f = 0.1)))
+plot(
+  siteOptim_l1, 
+  main = expression(lambda == 1), 
+  col = c('steelblue', NA, adjustcolor('steelblue', alpha.f = 0.1)))
+```
+
+## Skill scores
+
+### Mean skill scores
+
+```{r}
+cvRM %>% 
+  dcast(season ~ lambda, value.var = c('R2', 'RE', 'CE')) %>% 
+  roundDT(2)
+```
+
+### Skill distribution
+
+**Figure S12**
+
+```{r skill-boxplot, fig.width=6, fig.height=6}
+DT <- cv %>% 
+  melt(
+    id.vars = c('rep', 'season', 'lambda'),
+    measure.vars = c('R2', 'RE', 'CE'),
+    variable.name = 'metric',
+    value.name = 'value')
+hline <- DT[metric != 'R2', 
+            .(y = 0), 
+            by = .(season, metric)]
+ggplot(DT) +
+  geom_hline(
+    aes(yintercept = y), 
+    hline,
+    size = 0.3,
+    colour = 'firebrick') +
+  geom_boxplot(
+    aes(lambda, value, fill = season), 
+    width = 0.5,
+    alpha = 0.5, 
+    size = 0.3,
+    outlier.size = 0.8,
+    show.legend = FALSE) +
+  facet_grid(
+    vars(metric), vars(season), 
+    labeller = labeller(
+      metric = as_labeller(c(R2 = 'R\u00b2', RE = 'RE', CE = 'CE')),
+      season = as_labeller(ssnLabBrief)),
+    scales = 'free_y') +
+  scale_x_discrete(labels = lambdaLab) +
+  scale_fill_manual(values = dark2) +
+  labs(x = NULL, y = 'Metric value [-]') +
+  theme(
+    panel.spacing.y = unit(1.5, 'lines'),
+    strip.background = element_rect('gray90', NA),
+    axis.line.x = element_blank(), 
+    axis.ticks.x = element_blank()) 
+```
+
+Statistically skillful? We calculate the probability of RE > 0 and of CE > 0.
+
+```{r}
+cv[, .(pRE = .SD[RE > 0, .N] / .N,
+       pCE = .SD[CE > 0, .N] / .N), keyby = .(lambda, season)]
+```
+
+Model 0's wet season is not statistically skillful.
+
+## Trajectories
+
+```{r}
+# Make strings to merge to plot legend
+lambdaLegendDT <- cvRM[, roundDT(.SD, type = 'char')
+                     ][, .(lab = paste(lambdaLab(.BY$lambda), R2, RE, CE, sep = '    ')),
+                       by = .(season = as.character(season), lambda)]
+lambdaLegend <- function(s) {
+  function(x) lambdaLegendDT[season == s & lambda %in% x, lab]
+}
+
+# Select Model 1, apply low pass filter
+recFinal <- rec[lambda == '1.0']
+recFinal[, season := factor(season, seasons)]
+recFinal[, Qlpf := dplR::pass.filt(Q, 20, 'low')]
+```
+
+**Figure 3**
+
+```{r traj-plot-merged, fig.width=8, fig.height=9}
+p <- lapply(seasons, function(s) {
+  ggplot(rec[season == s & year %in% 1922:2003]) +
+    geom_line(aes(year, Q, colour = lambda, linetype = lambda)) +
+    geom_line(aes(year, Qa), p1tar[s], colour = 'gray', size = 0.2) +
+    scale_linetype_discrete(
+      name = c('          R\u00b2     RE     CE '),
+      labels = lambdaLegend(s)) +
+    scale_colour_manual(
+      name = c('          R\u00b2     RE     CE '),
+      values = c('steelblue', 'darkorange'),
+      labels = lambdaLegend(s)) +
+    scale_x_continuous(
+      breaks = seq(1920, 2000, 10),
+      labels = skip_label(2)) +
+    labs(x = NULL, 
+         y = if (s == 'JO') 'Q [million m\u00b3]' else '') +
+    facet_wrap(
+      vars(season), 
+      strip.position = 'right',
+      labeller = as_labeller(ssnLabBrief)) +
+    theme(
+      legend.title = element_text(hjust = 1, family = 'Lucida Sans Unicode'),
+      legend.text = element_text(family = 'Lucida Sans Unicode'),
+      axis.text.x = if (s != 'WY') element_blank(), 
+      axis.ticks.x = if (s != 'WY') element_blank(), 
+      axis.line.x = if (s != 'WY') element_blank(), 
+      strip.background = element_rect('gray95', NA),
+      legend.box.margin = unit(c(0, 0, 0, -0.5), 'cm'),
+      legend.key.width = unit(1, 'cm')) 
+    
+})
+
+trajPlotInst <- wrap_plots(p) + plot_layout(ncol = 1)
+
+p <- ggplot(recFinal) +
+  geom_hline(
+    aes(yintercept = Qm, colour = 'Long-term mean'), 
+    recFinal[, .(Qm = mean(Q)), by = season],
+    size = 0.2) +
+  geom_line(aes(year, Q, colour = 'Reconstruction (\u03bb = 1)'), size = 0.2) +
+  geom_line(aes(year, Qlpf, colour = '20-year low-pass filter'), size = 0.3) +
+  facet_wrap(
+    vars(season), 
+    scales = 'free_y',
+    labeller = as_labeller(ssnLabBrief),
+    strip.position = 'right',
+    ncol = 1) +
+  scale_x_continuous(
+    breaks = seq(1750, 2000, 10), 
+    labels = skip_label(5),
+    sec.axis = dup_axis()) +
+  scale_colour_manual(
+    name = NULL,
+    values = c('gray', 'black', 'firebrick'),
+    breaks = c('Reconstruction (\u03bb = 1)', '20-year low-pass filter', 'Long-term mean'),
+  ) +
+  labs(x = NULL, y = 'Q [million m\u00b3]') +
+  theme(
+    plot.margin = margin(t = 20),
+    strip.background = element_rect('gray95', NA),
+    legend.position = 'top',
+    legend.key.width = unit(1.2, 'cm'),
+    legend.text = element_text(family = 'Lucida Sans Unicode'))
+
+trajPlotFull <- wrap_plots(p) 
+
+layout <- c(
+  patchwork::area(1, 1,  30, 19),
+  patchwork::area(31, 1, 60, 20)
+)
+
+wrap_plots(trajPlotInst) + wrap_plots(trajPlotFull) + 
+  plot_layout(design = layout)
+```
+
+## Magnitude of adjustments
+
+**Figure S13**
+
+```{r, fig.width=8, fig.height=6}
+# Amount of adjustment
+adj <- rec[, dcast(.SD, season + year ~ lambda, value.var = 'Q')
+         ][, adj := `1.0` - `0.0`]
+# Density of adjustment amount
+adjDens <- adj[, {
+  s <- .BY$season
+  bw <- fcase(s == 'NJ', 30,
+              s == 'JO', 50,
+              s == 'WY', 9)
+  d <- density(adj, bw = bw, from = min(adj), to = max(adj))
+  data.table(x = d$x, y = d$y)
+}, by = season]
+
+trajPlotFull2 <- ggplot(rec) +
+  geom_line(aes(year, Q, colour = lambda, linetype = lambda), size = 0.4) +
+  scale_linetype_discrete(
+    name = NULL, 
+    label = lambdaLab) +
+  scale_colour_manual(
+    name = NULL,
+    values = c('steelblue', 'darkorange'),
+    labels = lambdaLab) +
+  labs(x = 'Year', 
+       y = 'Q [Mm\u00b3]') +
+  facet_wrap(vars(season), labeller = as_labeller(ssnLabBrief), ncol = 1, scales = 'free_y') +
+  theme(
+    legend.text = element_text(family = 'Lucida Sans Unicode'),
+    legend.position = 'top',
+    legend.key.width = unit(1.5, 'cm'),
+    strip.background = element_rect('gray95', NA))
+
+adjDensPlot <- ggplot(adjDens) +
+  geom_line(aes(x, y), size = 0.2) +
+  facet_wrap(vars(season), scales = 'free', ncol = 1, labeller = as_labeller(ssnLabBrief)) +
+  theme(strip.background = element_rect('gray95', NA)) +
+  labs(x = 'Adjustment [Mm\u00b3]', y = 'Density')
+
+trajPlotFull2 + adjDensPlot +
+  plot_layout(widths = c(3, 1)) 
+```
+
+
+## Selected inputs
+
+Extract selected inputs.
+
+```{r}
+mbPool[, prox := fifelse(site %in% crnMeta$site, 'RW', 'OX')]
+mbPool[, site.display := paste0(siteLab(site), ' ', prox, ' (', lag, ')')]
+mbPool[, selected := '\u2713']
+
+tickMat <- dcast(mbPool, lambda + prox + site.display ~ season, value.var = 'selected') %>% 
+  melt(
+    id.var = c('lambda', 'prox', 'site.display'), 
+    variable.name = 'season', 
+    value.name = 'selected')
+tickMat[is.na(selected), selected := ' ']
+tickMat[, site.display := factor(site.display, 
+                                 levels = sort(unique(site.display), decreasing = TRUE))]
+
+count <- tickMat[selected != ' ', .N, by = .(season, lambda)]
+```
+
+**Figure 4**
+
+```{r, fig.width=6, fig.height=6, warning=FALSE}
+yLabCol <- function(x) {
+  sapply(x, function(xx) {
+    ind <- grep('RW', xx)
+    if (length(ind) == 0) xx <- paste0(ind, '<span style="color:firebrick">', xx, '</span>')
+    xx
+  })
+}
+ssnLab2Lines <- function(l) {
+  n <- count[lambda == l, N]
+  function(s) {
+    out <- fcase(
+      s == 'NJ', 'Dry<br>season',
+      s == 'JO', 'Wet<br>season',
+      default = 'Water<br>year')
+    paste0(out, '<br>**', n, '**')
+  }
+} 
+
+p1 <- ggplot(tickMat[lambda == '0.0']) +
+  geom_text(
+    aes(season, site.display, label = selected, colour = prox), 
+    family = 'Arial Unicode MS',
+    show.legend = FALSE,
+    vjust = 0.25) +
+  facet_wrap(vars(lambda), labeller = as_labeller(lambdaLab)) +
+  scale_x_discrete(labels = ssnLab2Lines('0.0')) +
+  scale_y_discrete(labels = yLabCol, drop = FALSE) +
+  scale_colour_manual(values = c('firebrick', 'black')) +
+  labs(x = NULL, y = NULL) +
+  cowplot::panel_border('black', 0.2) +
+  theme(
+    axis.text.y = element_markdown(),
+    axis.text.x = element_markdown(lineheight = 1.5),
+    strip.text = element_text(family = 'Lucida Sans Unicode', face = 'bold'),
+    axis.ticks = element_blank())
+p2 <- ggplot(tickMat[lambda == '1.0']) +
+  geom_text(
+    aes(season, site.display, label = selected, colour = prox), 
+    family = 'Arial Unicode MS',
+    show.legend = FALSE,
+    vjust = 0.25) +
+  facet_wrap(vars(lambda), labeller = as_labeller(lambdaLab)) +
+  scale_x_discrete(labels = ssnLab2Lines('1.0')) +
+  scale_y_discrete(labels = yLabCol, drop = FALSE) +
+  scale_colour_manual(values = c('firebrick', 'black')) +
+  labs(x = NULL, y = NULL) +
+  cowplot::panel_border('black', 0.2) +
+  theme(
+    axis.text.y = element_blank(),
+    axis.text.x = element_markdown(lineheight = 1.5),
+    strip.text = element_text(family = 'Lucida Sans Unicode', face = 'bold'),
+    strip.background = element_blank(),
+    axis.ticks = element_blank())
+
+p1 + p2
+```
+
+## Annual mass balance
+
+Calculate mass difference.
+
+```{r deltaQ}
+deltaQ <- rec[, dcast(.SD, year + lambda ~ season, value.var = 'Q')
+            ][, dQ := NJ + JO - WY
+            ][, rQ := NJ / WY]
+densEst <- deltaQ[, {
+  bw <- if (.BY$lambda == '1.0') 50 else 80
+  ct <- if (.BY$lambda == '1.0') 1.5 else 1
+  d <- density(dQ, bw = bw, cut = ct)
+  data.table(x = d$x, y = d$y)
+}, by = lambda]
+```
+
+Probability of &Delta;Q within 10% mean annual flow (190 Mm<sub>3</sub>)? Range?
+
+```{r}
+Qmean <- p1merge[season == 'WY', mean(Qa)]
+deltaQ[, .(p = .SD[abs(dQ) > Qmean / 10, .N] / .N * 100,
+           min = min(dQ), 
+           max = max(dQ)),
+       by = lambda] %>% 
+  roundDT(0)
+```
+
+**Figure 5**
+
+```{r annual dQ, fig.width=7, fig.height=7}
+cols <- c('#984ea3', '#4daf4a')
+
+p1 <- ggplot(deltaQ) +
+  geom_line(aes(year, WY, linetype = 'Water year', colour = 'Water year'), size = 0.4) +
+  geom_line(aes(year, JO + NJ, linetype = 'Dry + Wet', colour = 'Dry + Wet'), size = 0.4) +
+  facet_wrap(
+    vars(lambda), 
+    ncol = 1,
+    labeller = as_labeller(lambdaLab)) +
+  scale_colour_manual(
+    name = NULL, 
+    values = cols) +
+  scale_linetype_manual(
+    name = NULL,
+    values = c(2, 1)) +
+  labs(x = 'Year', y = 'Q [million m\u00b3]') +
+  theme(
+    legend.position = 'none',
+    strip.text = element_text(family = 'Lucida Sans Unicode'),
+    strip.background = element_rect('gray90', NA))
+
+p2 <- ggplot(deltaQ) +
+  stat_density(
+    aes(y = WY, colour = 'Water year', linetype = 'Water year'), 
+    bw = 160, 
+    position = 'identity',
+    geom = 'line') +
+  stat_density(
+    aes(y = JO + NJ, colour = 'Dry + Wet', linetype = 'Dry + Wet'), 
+    bw = 160, 
+    position = 'identity',
+    geom = 'line') +
+  scale_x_continuous(breaks = scales::pretty_breaks(3), expand = c(0.01, 0)) +
+  scale_colour_manual(
+    name = NULL, 
+    values = cols) +
+  scale_linetype_manual(
+    name = NULL,
+    values = c(2, 1)) +
+  facet_wrap(
+    vars(lambda), 
+    ncol = 1,
+    labeller = as_labeller(lambdaLab)) +
+  labs(x = 'Density', y = NULL) +
+  theme(
+    legend.key.width = unit(0.95, 'cm'),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    strip.text = element_text(family = 'Lucida Sans Unicode'),
+    strip.background = element_rect('gray90', NA))
+
+p3 <- ggplot(deltaQ) +
+  geom_line(aes(year, dQ, colour = lambda, linetype = lambda), size = 0.4) +
+  scale_y_continuous(breaks = seq(-800, 800, 200), limits = abs_range(densEst$x)) +
+  scale_colour_manual(
+    name = NULL,
+    values = c('steelblue', 'darkorange'),
+    labels = lambdaLab) +
+  scale_linetype_manual(
+    name = NULL,
+    labels = lambdaLab,
+    values = c(1, 2)) +
+  labs(x = 'Year', y = '\u0394Q [million m\u00b3]') +
+  theme(legend.position = 'none')
+
+p4 <- ggplot(densEst) +
+  geom_area(
+    aes(x, y), 
+    densEst[x %between% c(-Qmean / 10, Qmean / 10) & lambda == 'l=1'], 
+    fill = 'gray95') +
+  geom_line(aes(x, y, colour = lambda, linetype = lambda)) +
+  scale_colour_manual(
+    name = NULL,
+    values = c('steelblue', 'darkorange'),
+    labels = lambdaLab) +
+  scale_x_continuous(breaks = seq(-800, 800, 200), limits = abs_range(densEst$x)) +
+  scale_y_continuous(expand = c(0.01, 0)) +
+  scale_linetype_manual(
+    name = NULL,
+    labels = lambdaLab,
+    values = c(1, 2)) +
+  coord_flip() +
+  labs(x = NULL, y = 'Density') +
+  theme(
+    legend.key.width = unit(0.95, 'cm'),
+    legend.text = element_text(family = 'Lucida Sans Unicode'),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank())
+
+p1 + p2 + p3 + p4 +
+  plot_layout(ncol = 2, widths = c(2, 1), heights = c(2, 1)) 
+```
+
+## Seasonal mass balance
+
+```{r seasonal dQ, fig.width=7, fig.height=7}
+cols1 <- RColorBrewer::brewer.pal(9, 'Set1')[c(3, 4)]
+cols2 <- RColorBrewer::brewer.pal(9, 'Set1')[c(2, 5)]
+
+p1 <- ggplot(deltaQ) +
+  geom_line(aes(year, WY - JO, linetype = 'WY - WS', colour = 'WY - WS'), size = 0.4) +
+  geom_line(aes(year, NJ, linetype = 'DS', colour = 'DS'), size = 0.4) +
+  facet_wrap(
+    vars(lambda), 
+    ncol = 1,
+    labeller = as_labeller(lambdaLab)) +
+  scale_colour_manual(
+    name = NULL, 
+    breaks = c('WY - WS', 'DS'),
+    values = cols1) +
+  scale_linetype_manual(
+    name = NULL,
+    breaks = c('WY - WS', 'DS'),
+    values = c(1, 2)) +
+  labs(x = 'Year', y = 'Q [million m\u00b3]') +
+  theme(
+    legend.position = 'none',
+    strip.text = element_text(family = 'Lucida Sans Unicode'),
+    strip.background = element_rect('gray90', NA))
+
+p2 <- ggplot(deltaQ) +
+  stat_density(
+    aes(y = NJ, colour = 'DS', linetype = 'DS'), 
+    bw = 100, 
+    position = 'identity',
+    geom = 'line') +
+  stat_density(
+    aes(y = WY - JO, colour = 'WY - WS', linetype = 'WY - WS'), 
+    bw = 100, 
+    position = 'identity',
+    geom = 'line') +
+  scale_x_continuous(breaks = scales::pretty_breaks(2), expand = c(0.01, 0)) +
+  scale_colour_manual(
+    name = NULL,
+    breaks = c('WY - WS', 'DS'),
+    values = cols1) +
+  scale_linetype_manual(
+    name = NULL,
+    breaks = c('WY - WS', 'DS'),
+    values = c(1, 2)) +
+  facet_wrap(
+    vars(lambda), 
+    ncol = 1,
+    labeller = as_labeller(lambdaLab)) +
+  labs(x = 'Density', y = NULL) +
+  theme(
+    legend.key.width = unit(0.95, 'cm'),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    strip.text = element_text(family = 'Lucida Sans Unicode'),
+    strip.background = element_rect('gray90', NA))
+
+p3 <- ggplot(deltaQ) +
+  geom_line(aes(year, WY - NJ, linetype = 'WY - DS', colour = 'WY - DS'), size = 0.4) +
+  geom_line(aes(year, JO, linetype = 'WS', colour = 'WS'), size = 0.4) +
+  facet_wrap(
+    vars(lambda), 
+    ncol = 1,
+    labeller = as_labeller(lambdaLab)) +
+  scale_colour_manual(
+    name = NULL, 
+    breaks = c('WY - DS', 'WS'),
+    values = cols2) +
+  scale_linetype_manual(
+    name = NULL,
+    breaks = c('WY - DS', 'WS'),
+    values = c(1, 2)) +
+  labs(x = 'Year', y = 'Q [million m\u00b3]') +
+  theme(
+    legend.position = 'none',
+    strip.text = element_text(family = 'Lucida Sans Unicode'),
+    strip.background = element_rect('gray90', NA))
+
+p4 <- ggplot(deltaQ) +
+  stat_density(
+    aes(y = JO, colour = 'WS', linetype = 'WS'), 
+    bw = 170, 
+    position = 'identity',
+    geom = 'line') +
+  stat_density(
+    aes(y = WY - NJ, colour = 'WY - DS', linetype = 'WY - DS'), 
+    bw = 170, 
+    position = 'identity',
+    geom = 'line') +
+  scale_x_continuous(breaks = scales::pretty_breaks(3), expand = c(0.01, 0)) +
+  scale_colour_manual(
+    name = NULL, 
+    breaks = c('WY - DS', 'WS'),
+    values = cols2) +
+  scale_linetype_manual(
+    name = NULL,
+    breaks = c('WY - DS', 'WS'),
+    values = c(1, 2)) +
+  facet_wrap(
+    vars(lambda), 
+    ncol = 1,
+    labeller = as_labeller(lambdaLab)) +
+  labs(x = 'Density', y = NULL) +
+  theme(
+    legend.key.width = unit(0.95, 'cm'),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    strip.text = element_text(family = 'Lucida Sans Unicode'),
+    strip.background = element_rect('gray90', NA))
+
+p1 + p2 + p3 + p4 +
+  plot_layout(ncol = 2, widths = c(2, 1)) 
+```
+
+## Flow ratio
+
+**Figure S14**
+
+```{r}
+p1mergeWide <- dcast(p1merge, year ~ season, value.var = 'Qa')
+p1mergeWide[, rQ := NJ / WY]
+
+rqDensEstRec <- deltaQ[, {
+  bw <- if (.BY$lambda == '1.0') 0.031 else 0.033
+  d <- density(rQ, bw = bw)
+  data.table(x = d$x, y = d$y)
+}, by = lambda]
+
+rqDensEstRecShort <- deltaQ[year %in% 1922:2005, {
+  bw <- if (.BY$lambda == '1.0') 0.031 else 0.033
+  d <- density(rQ, bw = bw)
+  data.table(x = d$x, y = d$y)
+}, by = lambda]
+
+rqDensEstInst <- p1mergeWide[, {
+    d <- density(rQ, bw = 0.045)
+    data.table(x = d$x, y = d$y)
+  }]
+```
+
+
+```{r, fig.width=7, fig.height=6}
+ggplot(deltaQ[lambda == '1.0'], aes(WY, rQ * 100)) +
+  geom_hline(yintercept = 50, colour = 'gray', size = 0.2) +
+  geom_point(aes(colour = 'Reconstructed'), size = 1) +
+  geom_point(aes(colour = 'Observed'), p1mergeWide) +
+  geom_text(
+    aes(label = year), 
+    rbind(
+      p1mergeWide[year %in% c(1971, 1973, 1975)],
+      p1mergeWide[order(rQ)][.N]),
+    size = 3,
+    nudge_x = 120) +
+  geom_text(
+    aes(label = year),
+    deltaQ[lambda == '1.0'][order(rQ)][.N],
+    size = 3,
+    nudge_x = 150) +
+  geom_text(
+    aes(label = year), 
+    deltaQ[lambda == '1.0' & year %in% c(1815, 1819, 1879)],
+    size = 3,
+    nudge_x = 120) +
+  scale_colour_manual(
+    name = NULL,
+    values = pal) +
+  scale_y_continuous(breaks = seq(20, 60, 5)) +
+  scale_x_continuous(breaks = seq(1000, 4000, 500)) +
+  labs(
+    x = 'Annual streamflow [million m\u00b3]', 
+    y = 'Fraction of dry season flow to annual flow [%]') +
+  theme(
+    legend.margin = margin(5, 5, 5, 5),
+    legend.background = element_rect(NA, 'black', 0.2),
+    legend.position = c(0.75, 0.9))
+```
+
+# References
+
+Nguyen, H. T. T., Galelli, S., Xu, C., & Buckley, B. M. (2020). Multi-Proxy, Multi-Season Streamflow Reconstruction with Mass Balance Adjustment. Earth and Space Science Archive. https://doi.org/10.1002/essoar.10504791.1
+
+Cook, B. I., & Buckley, B. M. (2009). Objective determination of monsoon season onset, withdrawal, and length. Journal of Geophysical Research, 114(D23), D23109. https://doi.org/10.1029/2009JD012795
+
+Gudmundsson, L., Bremnes, J. B., Haugen, J. E., & Engen-Skaugen, T. (2012). Technical Note: Downscaling RCM precipitation to the station scale using statistical transformations – a comparison of methods. Hydrology and Earth System Sciences, 16(9), 3383–3390. https://doi.org/10.5194/hess-16-3383-2012
+
+Gudmundsson, L. (2016). qmap: Statistical transformations for post-processing climate model output. R package version 1.0-4.
+
+Harris, I., Osborn, T. J., Jones, P., & Lister, D. (2020). Version 4 of the CRU TS monthly high-resolution gridded multivariate climate dataset. Scientific Data, 7(1), 109. https://doi.org/10.1038/s41597-020-0453-3

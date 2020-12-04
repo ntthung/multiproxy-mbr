@@ -1,0 +1,9 @@
+season,name,type
+JJ,Jan-Jun,Dry season
+JD,Jul-Dec,Wet season
+NJ,Nov-Jun,Dry season
+JO,Jul-Oct,Wet season
+DF,Dec-Feb,Winter
+MM,Mar-May,Summer
+CY,Jan-Dec,Annual
+WY,Nov-Oct,Water year
