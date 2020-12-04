@@ -1,3 +1,5 @@
+[![DOI](https://zenodo.org/badge/318567819.svg)](https://zenodo.org/badge/latestdoi/318567819)
+
 # Multi-Proxy, Multi-Season Streamflow Reconstruction with Mass Balance Adjustment
 
 Data and code to reproduce the entitled paper.
