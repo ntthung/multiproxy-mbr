@@ -800,7 +800,7 @@ The site selection script is provided in the file `site-selection-GA.R`. At the 
 source('site-selection-GA.R')
 ```
 
-or if you are using RStudio, we recommend that you submit it as a local job so that it does not freeze your RStudio. Alternatively, if you have access to a computing cluster, you can submit the script to your cluster. On a normal desktop, the script takes about 4 hours. On my 24-core 2.10 GHz cluster, it took about 33 minutes.
+or if you are using RStudio, we recommend that you submit it as a local job so that it does not freeze your RStudio. Alternatively, if you have access to a computing cluster, you can submit the script to your cluster. On a quad-core 3.4 GHz desktop with double threading (effectively 8 cores), the script took about an hour. On a 24-core 2.10 GHz computing node, it took about 20 minutes.
 
 In this repository, we provide two set of reconstructions, one with &lambda; = 0, and another with &lambda; = 1, as we presented in the paper. Both were run with `pop = 500` and `gen = 500`.
 
