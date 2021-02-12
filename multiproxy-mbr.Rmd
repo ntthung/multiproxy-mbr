@@ -30,6 +30,7 @@ Next, we load the necessary packages and utility functions.
 ```{r, message=FALSE, warning=FALSE}
 source('R/init.R')
 source('R/correlation_functions.R')
+source('R/input-selection-functions.R')
 ```
 
 We also use some special fonts for the plots, so we need to load them as well.
