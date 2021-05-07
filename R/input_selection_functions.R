@@ -85,14 +85,13 @@ wPCA <- function(X, rho = 1, p = 0, min.variance = 0.95, use.eigen = TRUE, retur
 #' @param n.site.min Minimum number of sites to be kept for each season
 #' @inheritParams cv_mb
 #' @param Xpool The input matrix of all the sites in the pool
-#' @param use.robust.mean Whether the arithmetic mean (if set to FALSE) or the Tukey's biweight robust mean is used to etermine the final value from cross-validation. Default is FALSE.
+#' @param use.robust.mean Whether the arithmetic mean (if set to FALSE) or the Tukey's biweight robust mean is used to determine the final value from cross-validation. Default is FALSE.
 #' @export
 cv_site_selection <- function(choice, pool, n.site.min = 5,
                              Xpool, instQ, cv.folds, start.year,
                              lambda = 1, log.trans, force.standardize = FALSE,
                              use.robust.mean = FALSE) {
 
- season <- N <- site <- NULL
  seasons <- levels(instQ$season)
  poolSubset <- pool[choice == 1L]
  num.targets <- length(seasons)
@@ -108,7 +107,7 @@ cv_site_selection <- function(choice, pool, n.site.min = 5,
 
    pcList <- lapply(seasons, function(s) {
      Qa <- instQ[s]
-     X <- Xpool[, poolSubset[s, site]]
+     X <- Xpool[, poolSubset[s, site2]]
      PC <- wPCA(X, use.eigen = FALSE, return.matrix = TRUE)
      sv <- input_selection(
        PC[instInd, , drop = FALSE],
@@ -116,8 +115,86 @@ cv_site_selection <- function(choice, pool, n.site.min = 5,
      PC[, sv, drop = FALSE]
    })
 
-   cvFval <- cv_mb(instQ, pcList, cv.folds, start.year, lambda, log.trans, force.standardize, return.type = 'mb')
+   cvFval <- cv_mb(instQ, pcList, cv.folds, start.year, lambda, log.trans, force.standardize, return.type = 'fval')
 
    if (use.robust.mean) -tbrm(cvFval) else -mean(cvFval)
  } else -1e12
+}
+
+# This function is a custom-made version of mbr::mb_reconstruction(), in order to extract the parameters
+# In a near future this option to extract the parameters will be incorporated into mb_reconstruction()
+
+mb_par <- function(instQ, pc.list, start.year, lambda = 1,
+                   log.trans = NULL, force.standardize = FALSE) {
+
+  # Setup
+  years     <- start.year:max(instQ$year)
+  instInd   <- which(years %in% instQ$year)
+  seasons   <- levels(instQ$season)
+  N         <- length(seasons)
+  sInd      <- 1:(N-1)
+  Y         <- instQ$Qa
+
+  XList     <- lapply(pc.list, mbr:::prepend_ones)
+  XListInst <- lapply(XList, function(x) x[instInd, , drop = FALSE])
+  X         <- as.matrix(Matrix:::.bdiag(XList))
+  XTrain    <- as.matrix(Matrix:::.bdiag(XListInst))
+
+  # NOTES:
+  # Working with matrices are much faster than with data.table
+  # Important to keep drop = FALSE; otherwise, when there is only one PC, a vector is returned.
+  # Use column form so that we can use c() later
+
+  # Calibration -------------------------------------
+
+  if (is.null(log.trans)) {
+
+    if (force.standardize) {
+
+      # Scale the observation
+      Y   <- matrix(Y, ncol = N)
+      Y   <- colScale(Y)
+      cm  <- attributes(Y)[['scaled:center']] # column mean
+      csd <- attributes(Y)[['scaled:scale']]  # column sd
+      Y   <- c(Y)
+
+      # Multiply X by sigma_s / sigma_q before making A
+      ratio   <- csd / csd[N]
+      Xscaled <- lapply(sInd, function(k) XListInst[[k]] * ratio[k])
+      A       <- cbind(do.call(cbind, Xscaled), -XListInst[[N]])
+    } else {
+      cm  <- NULL
+      csd <- NULL
+      A   <- cbind(do.call(cbind, XListInst[sInd]), -XListInst[[N]])
+    }
+
+    # Analytical solution when there is no transformation
+    XTX  <- crossprod(XTrain)
+    XTY  <- crossprod(XTrain, Y)
+    ATA  <- crossprod(A)
+    beta <- solve(XTX + lambda * ATA, XTY)
+
+  } else {  # Numerical solution
+
+    Y <- matrix(Y, ncol = N)
+    Y[, log.trans] <- log(Y[, log.trans])
+    if (length(log.trans) < N || force.standardize) {
+      Y   <- colScale(Y)
+      cm  <- attributes(Y)[['scaled:center']]
+      csd <- attributes(Y)[['scaled:scale']]
+    } else {
+      cm  <- NULL
+      csd <- NULL
+    }
+    Y <- c(Y)
+
+    log.seasons <- which(log.trans < N)
+    log.ann     <- max(log.trans) == N
+
+    beta <- mbr:::mb_fit(XTrain, Y, lambda, cm, csd, log.seasons, log.ann, N, sInd)
+  }
+
+  # Prediction ------------------------------------------
+
+  beta
 }

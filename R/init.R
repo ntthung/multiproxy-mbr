@@ -50,8 +50,6 @@ theme_set(my_theme)
 monthLab <- month.abb
 names(monthLab) <- 1:12
 
-lambdaLab <- function(x) sapply(x, function(v) paste0('\u03bb = ', substr(v, 1, 1)))
-
 dark2 <- RColorBrewer::brewer.pal(3, 'Dark2')[c(2, 1, 3)]
 
 pal <- wesanderson::wes_palette('Cavalcanti1')[c(2, 1)]
@@ -94,23 +92,26 @@ hinkley <- function(x, type = 2) {
   (mean(x, na.rm = TRUE) - median(x, na.rm = TRUE)) / scale
 }
 
-roundDT <- function(DT, digits = 2, type = 'numeric') {
-  DT[, lapply(.SD,
-              function(x) {
-                if (is.numeric(x)) {
-                  rd <- round(x, digits)
-                  if (type == 'numeric') rd else sprintf(glue("%.{digits}f"), rd)
-                } else x
-              })]
-}
 
-power_set <- function(N, min.size = 1, max.size = N) {
-  if (max.size > N) max.size <- N
-  if (min.size > N) NULL else {
-    subsets <- foreach(k = 1:N) %dopar% combn(1:N, k, simplify = FALSE)
-    subsets <- unlist(subsets, recursive = FALSE)
-    lengths <- sapply(subsets, length)
-    subsets[lengths %between% c(min.size, max.size)]
+roundDT <- function(DT, digits = 2, type = 'numeric') {
+  if (length(digits) == 1) {
+    DT[, lapply(.SD,
+                function(x) {
+                  if (is.numeric(x)) {
+                    rd <- round(x, digits)
+                    if (type == 'numeric') rd else sprintf(glue("%.{digits}f"), rd)
+                  } else x
+                })]
+  } else {
+    DT[, mapply(function(x, k) {
+      if (is.numeric(x)) {
+        rd <- round(x, k)
+        if (type == 'numeric') rd else sprintf(glue("%.{k}f"), rd)
+      } else x
+    },
+    x = .SD,
+    k = digits,
+    SIMPLIFY = FALSE)]
   }
 }
 
@@ -118,22 +119,6 @@ power_set <- function(N, min.size = 1, max.size = N) {
 
 lapplyrbind <- function(x, fun, ..., id = NULL) rbindlist(lapply(x, fun, ...), idcol = id)
 
-# Megadroughts
-
-mgd <- data.table(sta = c(1756, 1790, 1876),
-                  fin = c(1768, 1796, 1878),
-                  name = c('Strange Parallels Drought',
-                           'East India Drought',
-                           'Victorian Great Drought'))
 
 standardize <- function(x, ...) (x - mean(x, ...)) / sd(x, ...)
 
-boxcox_lambda <- function(x) {
-  bc <- MASS::boxcox(x ~ 1, plotit = FALSE)
-  bc$x[which.max(bc$y)]
-}
-
-boxcox <- function(x, lambda = NULL) {
-  if (is.null(lambda)) lambda <- boxcox_lambda(x)
-  if (abs(lambda) < 0.01) log(x) else (x^lambda - 1) / lambda
-}
