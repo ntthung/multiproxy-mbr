@@ -13,4 +13,4 @@ To reproduce the results, you can then open the file `multiproxy-mbr.Rmd` and fo
 
 ## Reference
 
-Nguyen, H. T. T., Galelli, S., Xu, C., & Buckley, B. (2020). Multi-Proxy, Multi-Season Streamflow Reconstruction with Mass Balance Adjustment. Earth and Space Science Open Archive, 22. https://doi.org/10.1002/essoar.10504791.1
+Nguyen, H. T. T., Galelli, S., Xu, C., & Buckley, B. M. (2021). Multiproxy, multi-season streamflow reconstruction with mass balance adjustment. Water Resources Research, 57, e2020WR029394. https://doi.org/10.1029/2020WR029394
